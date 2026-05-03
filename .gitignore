@@ -7,3 +7,5 @@
 *.log
 *.out
 *.synctex.gz
+make_tex_JP.sh
+.claude
