@@ -9,3 +9,4 @@
 *.synctex.gz
 make_tex_JP.sh
 .claude
+tex_to_md.md
