@@ -3,19 +3,42 @@ set -e
 
 cd "$(dirname "$0")"
 
-# ファイルが指定されているか確認
-if [ -z "$1" ]; then
-    echo "エラー: TeXファイルを指定してください．"
-    echo "使用例: bash $0 title.tex"
+# ---- 引数パース ----
+# 使用例:
+#   bash tex_to_md.sh title.tex
+#   bash tex_to_md.sh title.tex --Qiita   ← Qiita 互換出力モード
+QIITA_MODE=0
+FILE_PATH=""
+while [ $# -gt 0 ]; do
+    case "$1" in
+        --Qiita) QIITA_MODE=1 ;;
+        --) shift; break ;;
+        --*)
+            echo "エラー: 不明なオプション: $1" >&2
+            echo "使用例: bash $0 title.tex [--Qiita]" >&2
+            exit 1
+            ;;
+        *)
+            if [ -z "$FILE_PATH" ]; then
+                FILE_PATH="$1"
+            fi
+            ;;
+    esac
+    shift
+done
+
+if [ -z "$FILE_PATH" ]; then
+    echo "エラー: TeXファイルを指定してください．" >&2
+    echo "使用例: bash $0 title.tex [--Qiita]" >&2
     exit 1
 fi
-
-FILE_PATH="$1"
 
 # 末尾の .tex は付いていても付いていなくてもよい
 BASE="${FILE_PATH%.tex}"
 TEX="${BASE}.tex"
 MD="${BASE}.md"
+
+export QIITA_MODE
 
 # ---- ヘルパー ----
 sep()  { printf '\e[90m%s\e[0m\n' "────────────────────────────────────────────────────────────" >&2; }
@@ -192,12 +215,24 @@ fi
 #  11. \textcolor / pandoc の [text]{style="color: ..."} を <span> に変換
 #  12. 見出しに section 番号 ("# 1 タイトル", appendix なら "# 付録 1 タイトル") を付与
 #  13. 先頭に :::message タイトルブロックを挿入 (\maketitle は除去)
+if [ "$QIITA_MODE" = "1" ]; then
+    info "Qiita 互換モード: \\label 除去 / 見出しアンカー除去 / QED は inline 表記"
+fi
 info "後処理: title / heading / theorem / proof / refs / cite / textcolor / 数式 tag / minipage ..."
 
 python3 - "$TEX" "$MD" "${BIB_FOUND[@]}" <<'PYEOF'
+import os
 import re
 import sys
 from pathlib import Path
+
+# Qiita 互換モード (環境変数 QIITA_MODE=1) :
+#   1. 数式中の \label{...} を出力しない (KaTeX 非対応のため)．\tag{番号} は残す．
+#   3. proof の QED は <div style="text-align:right"> ではなく inline で末尾に置く
+#      (Qiita のサニタイザは style 属性を除去するため)．
+#   4. 見出し / 定理タイトル / 数式ブロックに付ける <a id="..."> アンカーを出力しない
+#      (Qiita のサニタイザは id 属性を除去するため)．
+QIITA = os.environ.get('QIITA_MODE') == '1'
 
 # ----- 環境名の日本語対応 -----
 ENV_JA = {
@@ -288,16 +323,21 @@ def parse_tex(tex_path):
         'authors':  [str, ...],
         'headings': [{'level': 1|2, 'number': str, 'title_raw': str,
                       'is_appendix': bool, 'labels': [str, ...]}, ...],
+        'theorems': [{'class': str, 'number': str, 'label': str|None}, ...],
       }
 
     - section / subsection を追跡 (番号付きのみ)
     - \\appendix 以降は section / 定理 / 数式番号に "付録" を付ける
     - theorem 系環境 (定理, 補題, …) は <section>.<thm_counter>
+      (aliascnt と同様, theorem / lemma / definition / remark / ... で
+       単一カウンタを共有する前提．preamble に従い PDF と同じ番号を再現する．)
+      ラベルがあるかに関わらず, 出現順に番号を 'theorems' に蓄積する．
     - 数式環境 (align, equation, gather, multline) は <section>.<eq_counter>
       (\\notag / \\nonumber が無い行のみ番号付与)
     - figure / table の \\label は番号付与
     """
-    result = {'labels': {}, 'title': None, 'authors': [], 'headings': []}
+    result = {'labels': {}, 'title': None, 'authors': [],
+              'headings': [], 'theorems': []}
     if not tex_path.exists():
         return result
 
@@ -340,6 +380,7 @@ def parse_tex(tex_path):
 
     labels = result['labels']
     headings = result['headings']
+    theorems = result['theorems']
     section_num = 0
     subsection_num = 0
     thm_counter = 0
@@ -408,6 +449,8 @@ def parse_tex(tex_path):
         if m.group('thm'):
             in_thm = m.group('thm')
             thm_counter += 1
+            num = with_appendix(f'{section_num}.{thm_counter}')
+            theorems.append({'class': in_thm, 'number': num, 'label': None})
             last_kind = 'theorem'
         elif m.group('thm_end'):
             in_thm = None
@@ -440,6 +483,8 @@ def parse_tex(tex_path):
             if in_thm is not None:
                 num = with_appendix(f'{section_num}.{thm_counter}')
                 labels[lbl] = {'type': in_thm, 'number': num}
+                if theorems and theorems[-1]['label'] is None:
+                    theorems[-1]['label'] = lbl
             elif last_kind == 'section' and headings:
                 num = with_appendix(headings[-1]['number'])
                 labels[lbl] = {'type': 'section', 'number': num}
@@ -653,6 +698,26 @@ def strip_tex_comments_in_math(content):
 
 
 # ====================================================================
+# 4c. Qiita モードでの align 内 \\ 倍化
+#   Qiita の数式は KaTeX を markdown 経由で渡すため,
+#   $$\begin{align} ... \\ ... \end{align}$$ の "\\" は
+#   markdown のエスケープで "\" に潰れ, 改行が効かなくなる．
+#   align / align* 環境の中身に限り "\\" -> "\\\\" に倍化する．
+# ====================================================================
+def qiita_double_backslash_in_align(content):
+    pat = re.compile(
+        r'(\\begin\{align\*?\})(.*?)(\\end\{align\*?\})',
+        re.DOTALL,
+    )
+
+    def repl(m):
+        body = m.group(2).replace('\\\\', '\\\\\\\\')
+        return m.group(1) + body + m.group(3)
+
+    return pat.sub(repl, content)
+
+
+# ====================================================================
 # 5. 数式 label に \tag{番号} と HTML アンカーを付与
 # ====================================================================
 def add_equation_anchors_and_tags(content, labels):
@@ -664,6 +729,19 @@ def add_equation_anchors_and_tags(content, labels):
         block_labels = label_re.findall(block)
         if not block_labels:
             return m.group(0)
+
+        if QIITA:
+            # Qiita (KaTeX) では \label が解釈できず数式全体が壊れるため除去．
+            # \tag{番号} のみ残す．id アンカーも Qiita のサニタイザで消えるので付けない．
+            def label_repl_qiita(lm):
+                lab = lm.group(1)
+                if lab in labels:
+                    num = labels[lab]['number']
+                    return f'\\tag{{{num}}}'
+                return ''
+            new_block = label_re.sub(label_repl_qiita, block)
+            return f'$${new_block}$$'
+
         anchors = '\n'.join(f'<a id="{lab}"></a>' for lab in block_labels)
 
         def label_repl(lm):
@@ -700,15 +778,20 @@ def quote_lines(text):
     return '\n'.join(out)
 
 
-def finalize_blocks(content, labels):
+def finalize_blocks(content, labels, theorems):
     """
     ::: {.proof} ブロック  -> **証明** ... <div ...>$\\square$</div>
     ::: {.theorem 等} ブロック -> blockquote 形式
+
+    theorem 系の番号は出現順に theorems[i] から取り出す
+    (aliascnt で counter を共有している前提．PDF と同じ番号になる)．
+    label が無くても番号が振られる．
     """
     pat = re.compile(
         r'^::: \{(?P<attrs>[^}]+)\}\n(?P<body>.*?)\n^:::\s*$',
         re.MULTILINE | re.DOTALL,
     )
+    state = {'idx': 0}
 
     def repl(m):
         attrs = m.group('attrs')
@@ -720,14 +803,23 @@ def finalize_blocks(content, labels):
 
         cls = next((c for c in classes if c in THM_CLASSES), None)
         if cls is not None:
-            return _finalize_theorem(body, ids, cls, labels)
+            entry = None
+            # 出現順に theorems を消費．class が一致しなければスキップ
+            # して次の同 class エントリを探す (頑健性のため)．
+            while state['idx'] < len(theorems):
+                cand = theorems[state['idx']]
+                state['idx'] += 1
+                if cand['class'] == cls:
+                    entry = cand
+                    break
+            return _finalize_theorem(body, ids, cls, labels, entry)
 
         return m.group(0)
 
     return pat.sub(repl, content)
 
 
-def _finalize_theorem(body, ids, cls, labels):
+def _finalize_theorem(body, ids, cls, labels, entry=None):
     """pandoc 出力の "**Title** (optional). 内容..." から
     optional / 内容 を取り出す．optional は括弧の入れ子に対応するため
     手書きでバランスを取る (\\begin{theorem}[Foo (cf. \\cite{...})] のような
@@ -766,14 +858,21 @@ def _finalize_theorem(body, ids, cls, labels):
         inner = rest.lstrip()
 
     label = ids[0] if ids else None
-    num = labels[label]['number'] if (label and label in labels) else ''
+    if label and label in labels:
+        num = labels[label]['number']
+    elif entry is not None:
+        # ラベル無しでも .tex 解析時の出現順から番号を当てる
+        num = entry['number']
+    else:
+        num = ''
     title = f'{ENV_JA[cls]} {num}'.strip()
     suffix = f' ({opt})' if opt else ''
 
     # 仕様 (tex_to_md.md):
     #   label がある場合は <a id="label">**定理 XX**</a> のように
     #   タイトル全体を <a> で囲む．
-    if label:
+    # Qiita モードでは id 属性がサニタイザで消えるため <a> を付けない．
+    if label and not QIITA:
         title_md = f'<a id="{label}">**{title}**</a>'
     else:
         title_md = f'**{title}**'
@@ -793,9 +892,41 @@ def _finalize_proof(body):
     # 末尾の QED 記号 (◻ U+25FB / ∎ U+220E) と末尾空白を除去
     body = re.sub(r'[\s◻∎□⦰]+\Z', '', body)
 
+    if QIITA:
+        # Qiita は inline style を除去するので, QED は本文末尾に inline で置く．
+        # \square は KaTeX 経由だとレイアウトが崩れがちなので Q.E.D. をそのまま書く．
+        return f'**{title}**\n\n{body} Q.E.D.\n'
+
     # 仕様: \square は右寄せ
     return (f'**{title}**\n\n{body}\n\n'
             f'<div style="text-align: right">$\\square$</div>\n')
+
+
+# ====================================================================
+# 6b. \href / \url を md リンクに
+#   pandoc は通常 \href{url}{text} を [text](url) に変換するが,
+#   raw_tex として残るケースに対する保険．
+# ====================================================================
+def convert_href(content):
+    # raw_tex 形式: `\href{url}{text}`{=latex}
+    content = re.sub(
+        r'`\\href\s*\{([^{}]*)\}\s*\{([^{}]*)\}`\{=latex\}',
+        r'[\2](\1)', content,
+    )
+    content = re.sub(
+        r'`\\url\s*\{([^{}]*)\}`\{=latex\}',
+        r'<\1>', content,
+    )
+    # 素のまま
+    content = re.sub(
+        r'\\href\s*\{([^{}]*)\}\s*\{([^{}]*)\}',
+        r'[\2](\1)', content,
+    )
+    content = re.sub(
+        r'\\url\s*\{([^{}]*)\}',
+        r'<\1>', content,
+    )
+    return content
 
 
 # ====================================================================
@@ -1027,6 +1158,11 @@ def _clean_bib_value(s):
     s = s.strip()
     while s.startswith('{') and s.endswith('}'):
         s = s[1:-1].strip()
+    # \href{url}{text} → [text](url)  (note フィールドの URL リンク等)
+    # 内側の braces ごと除去するブレース剥がし (下の re.sub) より前に処理する．
+    s = re.sub(r'\\href\s*\{([^{}]*)\}\s*\{([^{}]*)\}', r'[\2](\1)', s)
+    # \url{url} → url
+    s = re.sub(r'\\url\s*\{([^{}]*)\}', r'\1', s)
     s = re.sub(r'\{([^{}]*)\}', r'\1', s)
     s = s.replace('--', '–')
     s = re.sub(r'\s+', ' ', s)
@@ -1092,11 +1228,14 @@ def format_bib_body(entry):
         src_segments.append(pages)
     source = ', '.join(src_segments)
 
+    note = entry.get('note', '').strip()
+
     parts = []
     if author: parts.append(author)
     if title:  parts.append(title)
     if year:   parts.append(year)
     if source: parts.append(source)
+    if note:   parts.append(note)
     return ', '.join(parts)
 
 
@@ -1327,7 +1466,10 @@ def apply_heading_numbers(content, headings):
                     prefix = f'付録 {h["number"]}' if h['is_appendix'] else h['number']
                 else:
                     prefix = h['number']
-                anchors = ''.join(f' <a id="{lab}"></a>' for lab in h.get('labels', []))
+                if QIITA:
+                    anchors = ''
+                else:
+                    anchors = ''.join(f' <a id="{lab}"></a>' for lab in h.get('labels', []))
                 out.append(f'{hashes} {prefix} {title}{anchors}')
                 h_idx += 1
                 continue
@@ -1349,6 +1491,28 @@ def apply_heading_numbers(content, headings):
 #       ```
 #   が残ってしまうので, 空 (空白行のみ) のフェンスはまとめて消す．
 # ====================================================================
+def qiita_strip_anchors_and_links(content):
+    """Qiita 互換モード末段の整形:
+      - <a id="hogehoge">XXX</a> → XXX
+        (id 属性は Qiita のサニタイザで除去されるため, タグごと外して中身を残す．
+         参考文献 "[<a id=...>Display</a>] body" などに該当)
+      - [XXX](#anchor) → [XXX]
+        (内部 jump がそもそも効かないので, fragment リンクは外して括弧表記だけ残す．
+         画像 "![alt](url)" および外部 URL "[text](https://...)" は対象外)
+    """
+    # <a id="..."> ... </a>  ※ id 値はクオート付き / 無しどちらも許容
+    content = re.sub(
+        r'<a\s+id\s*=\s*(?:"[^"]*"|\'[^\']*\'|[^\s>]+)\s*>(.*?)</a>',
+        r'\1', content, flags=re.DOTALL,
+    )
+    # [XXX](#anchor) → [XXX]  (内部 fragment のみ; 直前が '!' なら画像なので除外)
+    content = re.sub(
+        r'(?<!!)\[([^\[\]]*?)\]\(#[^()\s]*\)',
+        r'[\1]', content,
+    )
+    return content
+
+
 def remove_empty_raw_tex(content):
     # fenced 形式: ```{=latex}\n<空白のみ>\n```
     content = re.sub(
@@ -1420,8 +1584,11 @@ def main():
     content = compact_tables(content)
     content = fix_align_aligned(content)
     content = strip_tex_comments_in_math(content)
+    if QIITA:
+        content = qiita_double_backslash_in_align(content)
     content = add_equation_anchors_and_tags(content, labels)
-    content = finalize_blocks(content, labels)
+    content = finalize_blocks(content, labels, parsed['theorems'])
+    content = convert_href(content)
     content = convert_refs(content, labels)
     content = convert_citations(content, bib_entries)
     cited_keys = collect_cited_keys(content)
@@ -1431,6 +1598,8 @@ def main():
     content = replace_bibliography(content, cited_keys, bib_entries)
     content = insert_title_block(content, parsed['title'], parsed['authors'])
     content = remove_empty_raw_tex(content)
+    if QIITA:
+        content = qiita_strip_anchors_and_links(content)
 
     md_path.write_text(content, encoding='utf-8')
 
