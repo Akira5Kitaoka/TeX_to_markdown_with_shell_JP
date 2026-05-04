@@ -1,7 +1,7 @@
-:::message
+<!--
 # TITLE
 - anonymous
-:::
+-->
 
 # 1 セクション
 
@@ -10,7 +10,6 @@
 
 > <a id="theo:test">**定理 1.1**</a>
 > $$e^{\pi i } = -1$$
-
 
 [定理 1.1](#theo:test)には$e^{\pi i }= -1$とかいてある．
 

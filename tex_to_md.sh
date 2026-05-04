@@ -1290,7 +1290,7 @@ def apply_heading_numbers(content, headings):
 
     lines = content.split('\n')
     out = []
-    in_memo = False
+    in_comment = False
     in_code = False
     h_idx = 0
 
@@ -1303,14 +1303,18 @@ def apply_heading_numbers(content, headings):
         if in_code:
             out.append(line)
             continue
-        if stripped == ':::message':
-            in_memo = True
+        # HTML コメント (<!-- ... -->) 内は heading として扱わない
+        # (タイトルブロックの "# title name" に節番号が付かないようにする)
+        if not in_comment and stripped.startswith('<!--'):
+            in_comment = True
             out.append(line)
+            if '-->' in stripped[4:]:
+                in_comment = False
             continue
-        if in_memo:
+        if in_comment:
             out.append(line)
-            if stripped == ':::':
-                in_memo = False
+            if '-->' in line:
+                in_comment = False
             continue
 
         m = re.match(r'^(#{1,2})\s+(.*)$', line)
@@ -1371,10 +1375,15 @@ def insert_title_block(content, title, authors):
     if title is None:
         return content
 
-    block = [':::message', f'# {title}']
+    # 仕様 (tex_to_md.md):
+    #   <!--
+    #   # title name
+    #   - author name1, author name2, ...
+    #   -->
+    block = ['<!--', f'# {title}']
     if authors:
         block.append('- ' + ', '.join(authors))
-    block.append(':::')
+    block.append('-->')
     return '\n'.join(block) + '\n\n' + content.lstrip('\n')
 
 
