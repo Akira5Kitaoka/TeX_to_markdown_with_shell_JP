@@ -394,6 +394,11 @@ def parse_tex(tex_path):
     def with_appendix(num):
         return f'付録 {num}' if in_appendix else num
 
+    def _clean_heading_title(raw):
+        s = re.sub(r'\\label\s*\{[^{}]*\}', '', raw)
+        s = re.sub(r'\s+', ' ', s).strip()
+        return s
+
     for m in token_re.finditer(text):
         if m.group('appendix'):
             in_appendix = True
@@ -416,6 +421,7 @@ def parse_tex(tex_path):
                     'level': 1,
                     'number': str(section_num),
                     'title_raw': title_raw,
+                    'title': _clean_heading_title(title_raw),
                     'is_appendix': in_appendix,
                     'labels': [],
                 })
@@ -430,6 +436,7 @@ def parse_tex(tex_path):
                     'level': 2,
                     'number': f'{section_num}.{subsection_num}',
                     'title_raw': title_raw,
+                    'title': _clean_heading_title(title_raw),
                     'is_appendix': in_appendix,
                     'labels': [],
                 })
@@ -487,11 +494,13 @@ def parse_tex(tex_path):
                     theorems[-1]['label'] = lbl
             elif last_kind == 'section' and headings:
                 num = with_appendix(headings[-1]['number'])
-                labels[lbl] = {'type': 'section', 'number': num}
+                labels[lbl] = {'type': 'section', 'number': num,
+                               'title': headings[-1]['title']}
                 headings[-1]['labels'].append(lbl)
             elif last_kind == 'subsection' and headings:
                 num = with_appendix(headings[-1]['number'])
-                labels[lbl] = {'type': 'subsection', 'number': num}
+                labels[lbl] = {'type': 'subsection', 'number': num,
+                               'title': headings[-1]['title']}
                 headings[-1]['labels'].append(lbl)
             elif last_kind == 'figure':
                 labels[lbl] = {'type': 'figure', 'number': str(fig_counter)}
@@ -511,11 +520,19 @@ def format_ref(label, labels):
     typ, num = info['type'], info['number']
     name = REF_NAMES.get(typ, typ)
     is_app = num.startswith('付録')
-    if typ == 'section':
-        text = num if is_app else f'第{num}節'
-    elif typ == 'subsection':
-        text = num if is_app else f'第{num}項'
-    elif typ == 'equation':
+    if typ in ('section', 'subsection'):
+        if typ == 'section':
+            text = num if is_app else f'第{num}節'
+        else:
+            text = num if is_app else f'第{num}項'
+        # 仕様: section / subsection の参照は本文中の番号付き見出しテキスト
+        # ("# 2 引用例" など) にジャンプさせる．GitHub Pages (kramdown) 等は
+        # 見出し ID を生成する際に空白を '-' に置換するため, アンカー側も
+        # "<番号>-<タイトル>" の形式にする．
+        title = info.get('title', '')
+        anchor = re.sub(r'\s+', '-', f'{num} {title}'.strip())
+        return f'[{text}](#{anchor})'
+    if typ == 'equation':
         # 仕様: appendix では "(付録 1.1)" / 通常は "式 (1.1)"
         text = f'({num})' if is_app else f'式 ({num})'
     else:
@@ -1461,16 +1478,19 @@ def apply_heading_numbers(content, headings):
             h = headings[h_idx]
             hashes = m.group(1)
             title = m.group(2).rstrip()
+            # pandoc は \section{タイトル \label{key}} を
+            # `# タイトル {#key}` のような heading attribute に変換するため除去．
+            # 生のまま残った \label{...} も併せて除去．
+            title = re.sub(r'\s*\{#[^{}]*\}\s*$', '', title)
+            title = re.sub(r'\s*\\label\s*\{[^{}]*\}\s*', ' ', title).strip()
             if h['level'] == len(hashes):
                 if h['level'] == 1:
                     prefix = f'付録 {h["number"]}' if h['is_appendix'] else h['number']
                 else:
                     prefix = h['number']
-                if QIITA:
-                    anchors = ''
-                else:
-                    anchors = ''.join(f' <a id="{lab}"></a>' for lab in h.get('labels', []))
-                out.append(f'{hashes} {prefix} {title}{anchors}')
+                # 仕様: section / subsection の <a id="..."> は付けない．
+                # 参照は本文中の番号付き見出しテキストへ直接ジャンプさせる．
+                out.append(f'{hashes} {prefix} {title}')
                 h_idx += 1
                 continue
         out.append(line)
@@ -1491,7 +1511,7 @@ def apply_heading_numbers(content, headings):
 #       ```
 #   が残ってしまうので, 空 (空白行のみ) のフェンスはまとめて消す．
 # ====================================================================
-def qiita_strip_anchors_and_links(content):
+def qiita_strip_anchors_and_links(content, labels):
     """Qiita 互換モード末段の整形:
       - <a id="hogehoge">XXX</a> → XXX
         (id 属性は Qiita のサニタイザで除去されるため, タグごと外して中身を残す．
@@ -1499,16 +1519,36 @@ def qiita_strip_anchors_and_links(content):
       - [XXX](#anchor) → [XXX]
         (内部 jump がそもそも効かないので, fragment リンクは外して括弧表記だけ残す．
          画像 "![alt](url)" および外部 URL "[text](https://...)" は対象外)
+      ただし section / subsection への参照リンクは Qiita が見出し ID を自動生成
+      するため, 機能リンクとしてそのまま残す．
     """
+    # section / subsection の参照アンカー集合 (format_ref と同じ生成規則)
+    section_anchors = set()
+    for info in labels.values():
+        if info.get('type') in ('section', 'subsection'):
+            num = info.get('number', '')
+            title = info.get('title', '')
+            anchor = re.sub(r'\s+', '-', f'{num} {title}'.strip())
+            if anchor:
+                section_anchors.add(anchor)
+
     # <a id="..."> ... </a>  ※ id 値はクオート付き / 無しどちらも許容
     content = re.sub(
         r'<a\s+id\s*=\s*(?:"[^"]*"|\'[^\']*\'|[^\s>]+)\s*>(.*?)</a>',
         r'\1', content, flags=re.DOTALL,
     )
+
     # [XXX](#anchor) → [XXX]  (内部 fragment のみ; 直前が '!' なら画像なので除外)
+    # section / subsection の参照は Qiita の自動生成見出し ID にそのまま当たるので残す．
+    def _strip_link(m):
+        text, anchor = m.group(1), m.group(2)
+        if anchor in section_anchors:
+            return m.group(0)
+        return f'[{text}]'
+
     content = re.sub(
-        r'(?<!!)\[([^\[\]]*?)\]\(#[^()\s]*\)',
-        r'[\1]', content,
+        r'(?<!!)\[([^\[\]]*?)\]\(#([^()\s]*)\)',
+        _strip_link, content,
     )
     return content
 
@@ -1599,7 +1639,7 @@ def main():
     content = insert_title_block(content, parsed['title'], parsed['authors'])
     content = remove_empty_raw_tex(content)
     if QIITA:
-        content = qiita_strip_anchors_and_links(content)
+        content = qiita_strip_anchors_and_links(content, labels)
 
     md_path.write_text(content, encoding='utf-8')
 
