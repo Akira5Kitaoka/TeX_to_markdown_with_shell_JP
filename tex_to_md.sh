@@ -1261,6 +1261,26 @@ def collect_cited_keys(content):
     return set(re.findall(r'\(#ref-([^)\s]+)\)', content))
 
 
+def collect_tex_cite_keys(tex_path):
+    """.tex を直接スキャンして \\cite / \\citet / \\citep / \\cites で
+    引用されているキーをすべて収集する．
+    abstract など pandoc が本文に展開しない箇所の引用も拾うため．"""
+    if not tex_path.exists():
+        return set()
+    text = tex_path.read_text(encoding='utf-8')
+    text = re.sub(r'(?<!\\)%[^\n]*', '', text)
+    keys = set()
+    # \cite, \citet, \citep, \citealp など \cite 系
+    for m in re.finditer(r'\\cite[A-Za-z]*\s*(?:\[[^\]]*\])*\s*((?:\{[^}]+\})+)',
+                         text):
+        for grp in re.findall(r'\{([^}]+)\}', m.group(1)):
+            for k in grp.split(','):
+                k = k.strip()
+                if k:
+                    keys.add(k)
+    return keys
+
+
 # ====================================================================
 # 8-app. \appendix の文字 / \bibliographystyle / \bibliography を md から消す
 # ====================================================================
@@ -1287,10 +1307,11 @@ def replace_bibliography(content, cited_keys, bib_entries):
     content = re.sub(r'`\\bibliographystyle\{[^}]*\}`\{=latex\}\s*', '', content)
     content = re.sub(r'\\bibliographystyle\s*\{[^}]*\}\s*', '', content)
 
-    # 参考文献ブロック組み立て (cited のみ / 無ければ全件)
-    if bib_entries:
-        keys = sorted(k for k in cited_keys if k in bib_entries) \
-               if cited_keys else sorted(bib_entries.keys())
+    # 参考文献ブロック組み立て (cited されたキーのみ).
+    # cited_keys が空なら参考文献セクションは出さない (.bib 全件のフォールバックは
+    # しない; 未引用の文献まで出てしまうため)．
+    if bib_entries and cited_keys:
+        keys = sorted(k for k in cited_keys if k in bib_entries)
     else:
         keys = []
 
@@ -1631,7 +1652,11 @@ def main():
     content = convert_href(content)
     content = convert_refs(content, labels)
     content = convert_citations(content, bib_entries)
-    cited_keys = collect_cited_keys(content)
+    # cited_keys は (1) md 本文に残っている (#ref-KEY) と
+    # (2) .tex を直接スキャンした \cite 系 (abstract 等 pandoc が落とす箇所も含む)
+    # の和集合．未引用の bib エントリを混入させないため，フォールバックの全件
+    # 出力は廃止している．
+    cited_keys = collect_cited_keys(content) | collect_tex_cite_keys(tex_path)
     content = transform_textcolor(content)
     content = apply_heading_numbers(content, parsed['headings'])
     content = remove_appendix_marker(content)
